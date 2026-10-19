@@ -1,8 +1,10 @@
 package intervalsicu_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/truongnhan0311/intervalsicu"
 )
@@ -164,5 +166,130 @@ func mustUnmarshal(t *testing.T, data string, dest any) {
 
 	if err := json.Unmarshal([]byte(data), dest); err != nil {
 		t.Fatalf("unmarshal: %v", err)
+	}
+}
+
+// An activity with no usable start is better as a zero time than as a
+// confidently wrong one: a caller can test for it, a silently shifted date
+// just lands the ride on the wrong day of the training log.
+func TestStartIsZeroWhenThereIsNothingToParse(t *testing.T) {
+	cases := map[string]intervalsicu.Activity{
+		"no dates at all":        {ID: "i1"},
+		"only an unusable UTC":   {ID: "i2", StartDate: "last tuesday"},
+		"unparseable local time": {ID: "i3", StartDateLocal: "yesterday evening", Timezone: "Europe/Paris"},
+	}
+
+	for name, activity := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := activity.Start(); !got.IsZero() {
+				t.Errorf("want the zero time, got %s", got)
+			}
+		})
+	}
+}
+
+// A bad UTC stamp must not stop the local time from being used.
+func TestStartFallsBackToLocalWhenUtcIsUnusable(t *testing.T) {
+	activity := intervalsicu.Activity{
+		StartDate:      "not a timestamp",
+		StartDateLocal: "2026-03-14T18:30:00",
+		Timezone:       "Asia/Ho_Chi_Minh",
+	}
+
+	want := time.Date(2026, 3, 14, 11, 30, 0, 0, time.UTC)
+	if got := activity.Start(); !got.Equal(want) {
+		t.Errorf("want %s, got %s", want, got)
+	}
+}
+
+// An unknown timezone name falls back to UTC rather than failing outright.
+func TestStartTreatsAnUnknownTimezoneAsUtc(t *testing.T) {
+	activity := intervalsicu.Activity{
+		StartDateLocal: "2026-03-14T18:30:00",
+		Timezone:       "Mars/Olympus_Mons",
+	}
+
+	want := time.Date(2026, 3, 14, 18, 30, 0, 0, time.UTC)
+	if got := activity.Start(); !got.Equal(want) {
+		t.Errorf("want %s, got %s", want, got)
+	}
+}
+
+func TestActivityPropagatesAFetchError(t *testing.T) {
+	client, _ := newFake(t, routes{})
+
+	_, err := client.Activity(context.Background(), "i-missing")
+	if err == nil {
+		t.Fatal("want an error for an activity the server does not have, got nil")
+	}
+	if !intervalsicu.IsNotFound(err) {
+		t.Errorf("want a not-found error, got %v", err)
+	}
+}
+
+func TestActivityRejectsAnEmptyID(t *testing.T) {
+	client, seen := newFake(t, routes{})
+
+	if _, err := client.Activity(context.Background(), ""); err == nil {
+		t.Fatal("want an error for an empty id, got nil")
+	}
+	if len(seen) != 0 {
+		t.Errorf("an empty id must not reach the server, got %v", seen)
+	}
+}
+
+// A field of the wrong type must come back as an error, not a panic or a
+// half-filled activity.
+func TestActivityUnmarshalRejectsAMistypedField(t *testing.T) {
+	var activity intervalsicu.Activity
+
+	if err := json.Unmarshal([]byte(`{"id":123}`), &activity); err == nil {
+		t.Fatal("want a decode error for a numeric id, got nil")
+	}
+}
+
+func TestActivityFetchesOneRide(t *testing.T) {
+	client, seen := newFake(t, routes{
+		"/activity/i123": `{
+          "id":"i123",
+          "type":"Ride",
+          "icu_training_load":82,
+          "device_watts":true
+        }`,
+	})
+
+	activity, err := client.Activity(context.Background(), "i123")
+	if err != nil {
+		t.Fatalf("Activity: %v", err)
+	}
+	if activity.ID != "i123" {
+		t.Errorf("want id i123, got %q", activity.ID)
+	}
+	if !activity.HasRealPower() {
+		t.Error("device_watts true must read as real power")
+	}
+	if _, ok := seen["/activity/i123"]; !ok {
+		t.Errorf("want the activity endpoint called, got %v", seen)
+	}
+}
+
+// An id with a slash in it must stay inside the activity path instead of
+// walking up to another endpoint.
+func TestActivityEscapesTheIDInThePath(t *testing.T) {
+	client, seen := newFake(t, routes{})
+
+	_, _ = client.Activity(context.Background(), "i1/../athlete")
+
+	if _, ok := seen["/athlete"]; ok {
+		t.Fatalf("the id walked out of the activity path, got %v", seen)
+	}
+	request, ok := seen["/activity/i1/../athlete"]
+	if !ok {
+		t.Fatalf("want the activity endpoint called, got %v", seen)
+	}
+	// Go only leaves the dot segments in place because they arrived escaped;
+	// an unescaped id would have been collapsed before the request was sent.
+	if escaped := request.URL.EscapedPath(); escaped != "/activity/i1%2F..%2Fathlete" {
+		t.Errorf("want the id escaped into one path segment, got %q", escaped)
 	}
 }

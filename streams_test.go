@@ -2,6 +2,7 @@ package intervalsicu_test
 
 import (
 	"math"
+	"sort"
 	"testing"
 	"time"
 
@@ -117,5 +118,106 @@ func TestStreamsRejectsUnknownShape(t *testing.T) {
 
 	if _, err := client.ActivityStreams(t.Context(), "i1"); err == nil {
 		t.Error("expected an error for an unrecognised response shape")
+	}
+}
+
+func TestStreamsNamesListsChannels(t *testing.T) {
+	client, _ := newFake(t, routes{
+		"/activity/i1/streams": `[{"type":"watts","data":[1]},{"type":"heartrate","data":[2]}]`,
+	})
+
+	streams, err := client.ActivityStreams(t.Context(), "i1")
+	if err != nil {
+		t.Fatalf("ActivityStreams: %v", err)
+	}
+
+	names := streams.Names()
+	if len(names) != 2 {
+		t.Fatalf("Names() = %v, want two entries", names)
+	}
+	sort.Strings(names)
+	if names[0] != "heartrate" || names[1] != "watts" {
+		t.Errorf("Names() = %v", names)
+	}
+}
+
+func TestStreamsGetReportsAbsence(t *testing.T) {
+	// Distinguishing "no such channel" from "a channel of zero samples"
+	// matters: the first means the device never recorded it.
+	client, _ := newFake(t, routes{
+		"/activity/i1/streams": `[{"type":"watts","data":[1]}]`,
+	})
+
+	streams, err := client.ActivityStreams(t.Context(), "i1")
+	if err != nil {
+		t.Fatalf("ActivityStreams: %v", err)
+	}
+
+	if _, ok := streams.Get("cadence"); ok {
+		t.Error("Get should report a missing channel as absent")
+	}
+	if _, ok := streams.Get(intervalsicu.StreamWatts); !ok {
+		t.Error("Get should find a present channel")
+	}
+}
+
+func TestEmptyStreamHelpersDoNotPanic(t *testing.T) {
+	var empty intervalsicu.Stream
+
+	if empty.Len() != 0 {
+		t.Error("Len on a zero Stream should be 0")
+	}
+	if got := empty.Coverage(); got != 0 {
+		t.Errorf("Coverage on a zero Stream = %v, want 0", got)
+	}
+	if got := empty.Ints(-1); len(got) != 0 {
+		t.Errorf("Ints on a zero Stream = %v, want empty", got)
+	}
+	if got := empty.Floats(0); len(got) != 0 {
+		t.Errorf("Floats on a zero Stream = %v, want empty", got)
+	}
+}
+
+func TestStreamIntsRoundsNegativesAwayFromZero(t *testing.T) {
+	// Altitude below sea level and temperature both go negative; truncating
+	// toward zero would bias every such sample upward.
+	client, _ := newFake(t, routes{
+		"/activity/i1/streams": `[{"type":"altitude","data":[-3.6,-3.4,3.6]}]`,
+	})
+
+	streams, err := client.ActivityStreams(t.Context(), "i1")
+	if err != nil {
+		t.Fatalf("ActivityStreams: %v", err)
+	}
+	altitude, _ := streams.Get("altitude")
+
+	got := altitude.Ints(0)
+	if got[0] != -4 || got[1] != -3 || got[2] != 4 {
+		t.Errorf("Ints = %v, want [-4 -3 4]", got)
+	}
+}
+
+func TestStreamsSkipEntriesWithoutAType(t *testing.T) {
+	client, _ := newFake(t, routes{
+		"/activity/i1/streams": `[{"data":[1,2]},{"type":"watts","data":[3]}]`,
+	})
+
+	streams, err := client.ActivityStreams(t.Context(), "i1")
+	if err != nil {
+		t.Fatalf("ActivityStreams: %v", err)
+	}
+	if len(streams) != 1 {
+		t.Errorf("got %d streams, want 1 — an entry with no type names nothing", len(streams))
+	}
+}
+
+func TestStreamsWithoutTypesFilterSendsNoQuery(t *testing.T) {
+	client, seen := newFake(t, routes{"/activity/i1/streams": `[]`})
+
+	if _, err := client.ActivityStreams(t.Context(), "i1"); err != nil {
+		t.Fatalf("ActivityStreams: %v", err)
+	}
+	if got := seen["/activity/i1/streams"].URL.RawQuery; got != "" {
+		t.Errorf("query = %q, want empty so the server chooses", got)
 	}
 }
